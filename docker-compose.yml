@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: superset_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - superset-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: superset_redis
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redis_data:/data
+    networks:
+      - superset-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  superset-init:
+    build: .
+    container_name: superset_init
+    command: >
+      sh -c "superset db upgrade && superset fab create-admin --username ${SUPERSET_ADMIN_USERNAME} --firstname Admin --lastname User --email ${SUPERSET_ADMIN_EMAIL} --password ${SUPERSET_ADMIN_PASSWORD} && superset init"
+    env_file: .env
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    networks:
+      - superset-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  superset-app:
+    build: .
+    container_name: superset_main
+    command: gunicorn -b 0.0.0.0:8088 --access-logfile - --error-logfile - "superset.app:create_app()"
+    ports:
+      - '8088:8088'
+    env_file: .env
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    networks:
+      - superset-network
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully 
+
+  superset-worker:
+    build: .
+    container_name: superset_worker
+    command: celery --app=superset.tasks.celery_app:app worker -l INFO
+    env_file: .env
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    networks:
+      - superset-network
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+
+  superset-beat:
+    build: .
+    container_name: superset_beat
+    command: celery --app=superset.tasks.celery_app:app beat -l INFO -s /tmp/celerybeat-schedule
+    env_file: .env
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    networks:
+      - superset-network
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+
+  flower:
+    build: .
+    container_name: superset_flower
+    command: celery --app=superset.tasks.celery_app:app flower --address=0.0.0.0 --port=5555 --basic_auth=admin:admin
+    ports:
+      - '5555:5555'
+    env_file: .env
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py
+    networks:
+      - superset-network
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local
+    name: postgres_data_volume
+  redis_data:
+    driver: local
+    name: redis_data_volume
+
+networks:
+  superset-network:
+    driver: bridge
+    name: superset_network
